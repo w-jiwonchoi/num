@@ -170,7 +170,7 @@ def test_cg_local(N: int = 10_000) -> bool:
         b = np.ones(A.shape[0], dtype=np.float64)
 
         # SciPy reference
-        x_ref, info = spla.cg(A, b, tol=1e-12, maxiter=5000)
+        x_ref, info = spla.cg(A, b, rtol=1e-12, maxiter=5000)
         if info != 0:
             print(f"    [WARN] SciPy CG did not converge for {mat_name} (info={info})",
                   file=sys.stderr)
@@ -287,7 +287,7 @@ def test_distributed_cg(N: int = 20_000) -> bool:
     A = get_matrix('laplacian_3d', N)
     b = np.ones(A.shape[0], dtype=np.float64)
 
-    x_ref, info = spla.cg(A, b, tol=1e-12, maxiter=5000)
+    x_ref, info = spla.cg(A, b, rtol=1e-12, maxiter=5000)
     if rank == 0 and info != 0:
         print(f"    [WARN] SciPy CG did not converge (info={info})", file=sys.stderr)
 
