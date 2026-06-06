@@ -56,9 +56,8 @@ void launch_batch_spmv(
     int N, int k,
     std::pair<int,int> tile = {0, 0})
 {
-    using Policy = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<2>,
-                                         Kokkos::Iterate::Right,
-                                         Kokkos::Iterate::Right>;
+    using Policy = Kokkos::MDRangePolicy<Exec, Kokkos::Rank<2, Kokkos::Iterate::Right, Kokkos::Iterate::Right>>;
+
 
     // Heuristic default tiles: 32 rows × 4 rhs columns (fits one warp nicely)
     int tr = (tile.first  == 0) ? std::min(32, N) : tile.first;
