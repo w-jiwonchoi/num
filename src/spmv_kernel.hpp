@@ -55,8 +55,7 @@ void launch_spmv_custom(
     using Policy = Kokkos::TeamPolicy<Exec>;
     int nrows = A.numRows();
 
-    Policy policy(nrows,
-                  team_size == 0 ? Kokkos::AUTO : team_size);
+    Policy policy(nrows, Kokkos::AUTO);
 
     SpMVFunctor<Exec> functor{A, x, y};
     Kokkos::parallel_for("SpMV_TeamPolicy", policy, functor);
