@@ -5,17 +5,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ─── Optional CUDA enable ──────────────────────────────────────────────────────
+# ─── Backend options ──────────────────────────────────────────────────────────
 option(KOKKOS_ENABLE_CUDA   "Enable CUDA backend"   ON)
 option(KOKKOS_ENABLE_HIP    "Enable HIP backend"    OFF)
 option(KOKKOS_ENABLE_OPENMP "Enable OpenMP backend" OFF)
 
-# ─── Architecture flags (set one that matches your hardware) ──────────────────
-# A100 → AMPERE80, V100 → VOLTA70, H100 → HOPPER90, MI250X → AMD_GFX90A
+# Architecture: A100 → AMPERE80, V100 → VOLTA70, H100 → HOPPER90
 set(KOKKOS_ARCH "AMPERE80" CACHE STRING "Kokkos architecture flag")
 
 # ─── Kokkos ───────────────────────────────────────────────────────────────────
-# Prefer installed Kokkos; fall back to FetchContent.
+# Prefer an installed Kokkos (as in the Vessel AI Docker image); fall back to
+# FetchContent.
 find_package(Kokkos 4.0 QUIET)
 if(NOT Kokkos_FOUND)
     message(STATUS "Kokkos not found locally — fetching via FetchContent")
@@ -23,7 +23,7 @@ if(NOT Kokkos_FOUND)
     FetchContent_Declare(
         kokkos
         GIT_REPOSITORY https://github.com/kokkos/kokkos.git
-        GIT_TAG        4.3.01
+        GIT_TAG        4.7.02          # matches Vessel AI Docker image
     )
     set(Kokkos_ENABLE_CUDA   ${KOKKOS_ENABLE_CUDA}   CACHE BOOL "" FORCE)
     set(Kokkos_ENABLE_HIP    ${KOKKOS_ENABLE_HIP}    CACHE BOOL "" FORCE)
@@ -40,12 +40,12 @@ if(NOT KokkosKernels_FOUND)
     FetchContent_Declare(
         kokkos_kernels
         GIT_REPOSITORY https://github.com/kokkos/kokkos-kernels.git
-        GIT_TAG        4.3.01
+        GIT_TAG        4.7.02          # matches Vessel AI Docker image
     )
     FetchContent_MakeAvailable(kokkos_kernels)
 endif()
 
-# ─── MPI ─────────────────────────────────────────────────────────────────────
+# ─── MPI ──────────────────────────────────────────────────────────────────────
 find_package(MPI REQUIRED)
 
 # ─── Python + nanobind ────────────────────────────────────────────────────────
@@ -67,14 +67,28 @@ target_link_libraries(kokkos_spmv PRIVATE
     MPI::MPI_CXX
 )
 
+# ─── nanobind -Os workaround ──────────────────────────────────────────────────
+# nanobind injects -Os into compile flags.  nvcc_wrapper does NOT support -Os
+# (it passes unknown flags straight to nvcc which rejects them).
+# Override with -O3 for CXX (which nvcc_wrapper translates to --optimize 3).
+# This matches the note in the project PPTX.
 target_compile_options(kokkos_spmv PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
     $<$<COMPILE_LANGUAGE:CXX>:-Wall>
     $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
 )
 
-# ─── CUDA-aware MPI check ─────────────────────────────────────────────────────
-# Enable if your MPI installation supports GPU pointers.
+# Strip -Os that nanobind may have added (CMake 3.25+ supports
+# COMPILE_OPTIONS target property manipulation; for older versions we rely on
+# the override above since -O3 appears later and wins on GCC/Clang/nvcc).
+# For belt-and-suspenders, also set the global flag when using nvcc_wrapper:
+if(CMAKE_CXX_COMPILER MATCHES "nvcc_wrapper")
+    string(REPLACE "-Os" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    string(REPLACE "-Os" "" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
+    message(STATUS "nvcc_wrapper detected: removed -Os flag")
+endif()
+
+# ─── CUDA-aware MPI ───────────────────────────────────────────────────────────
 option(ENABLE_CUDA_AWARE_MPI "Pass GPU pointers directly to MPI" OFF)
 if(ENABLE_CUDA_AWARE_MPI)
     target_compile_definitions(kokkos_spmv PRIVATE CUDA_AWARE_MPI=1)
@@ -96,12 +110,17 @@ if(BUILD_TESTS)
             Kokkos::kokkoskernels
             MPI::MPI_CXX
         )
+        # Also apply the -Os workaround to test binaries
         target_compile_options(${test_name} PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-O2>
         )
         add_test(NAME ${test_name}
-                 COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1
-                         ./${test_name})
+                 COMMAND
+                     ${MPIEXEC_EXECUTABLE}
+                     ${MPIEXEC_NUMPROC_FLAG} 1
+                     # Allow root execution (required in Vessel AI containers)
+                     --allow-run-as-root
+                     ./${test_name})
     endforeach()
 endif()
 
