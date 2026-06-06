@@ -75,7 +75,7 @@ def bench_scipy_cg(A: sp.csr_matrix, b: np.ndarray,
         iters_box[0] += 1
 
     t0 = time.perf_counter()
-    x, info = spla.cg(A, b, tol=tol, maxiter=max_iter, callback=callback)
+    x, info = spla.cg(A, b, rtol=tol, maxiter=max_iter, callback=callback)
     elapsed = time.perf_counter() - t0
     res = np.linalg.norm(b - A @ x) / np.linalg.norm(b)
     return {
