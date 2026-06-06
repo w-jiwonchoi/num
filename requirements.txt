@@ -1,0 +1,21 @@
+# ─── Core scientific stack ────────────────────────────────────────────────────
+numpy>=1.24
+scipy>=1.11
+# ─── GPU array ────────────────────────────────────────────────────────────────
+cupy-cuda12x>=13.0         # adjust suffix to match your CUDA toolkit version
+# ─── JAX (CPU+GPU) for baseline comparison ────────────────────────────────────
+# Install JAX with CUDA support:
+#   pip install "jax[cuda12]"
+# Listed separately so the Docker build can selectively install it.
+jax>=0.4.20
+jaxlib>=0.4.20
+# ─── MPI Python bindings ──────────────────────────────────────────────────────
+mpi4py>=3.1
+# ─── Benchmarking and plotting ────────────────────────────────────────────────
+matplotlib>=3.8
+pandas>=2.1
+tabulate>=0.9
+# ─── Build tooling ────────────────────────────────────────────────────────────
+nanobind>=2.0
+cmake>=3.22
+ninja
