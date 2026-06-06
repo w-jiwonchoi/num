@@ -1,20 +1,29 @@
 # ─── Core scientific stack ────────────────────────────────────────────────────
 numpy>=1.24
 scipy>=1.11
+
 # ─── GPU array ────────────────────────────────────────────────────────────────
-cupy-cuda12x>=13.0         # adjust suffix to match your CUDA toolkit version
-# ─── JAX (CPU+GPU) for baseline comparison ────────────────────────────────────
-# Install JAX with CUDA support:
-#   pip install "jax[cuda12]"
-# Listed separately so the Docker build can selectively install it.
+# CUDA 12.8 → use cupy-cuda12x
+cupy-cuda12x>=13.0
+
+# ─── JAX (CPU + GPU) for baseline comparison ──────────────────────────────────
+# The PPTX specifies jax[cuda13] for Vessel AI (CUDA 12.8 is compatible).
+# Install with: pip install "jax[cuda12]"  or  "jax[cuda13]"
 jax>=0.4.20
 jaxlib>=0.4.20
+
 # ─── MPI Python bindings ──────────────────────────────────────────────────────
+# The PPTX specifies mpi4py from the 4.1.1 git tag (not PyPI release).
+# This is important: pip install mpi4py installs an older version that may
+# not work correctly with OpenMPI 5.x built against CUDA 12.8.
+# Install with: pip install "mpi4py @ git+https://github.com/mpi4py/mpi4py@4.1.1"
 mpi4py>=3.1
+
 # ─── Benchmarking and plotting ────────────────────────────────────────────────
 matplotlib>=3.8
 pandas>=2.1
 tabulate>=0.9
+
 # ─── Build tooling ────────────────────────────────────────────────────────────
 nanobind>=2.0
 cmake>=3.22
