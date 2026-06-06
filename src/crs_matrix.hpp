@@ -74,7 +74,7 @@ struct CrsMatrixHandle {
         auto dr = Kokkos::create_mirror_view_and_copy(MemSpace{}, hr);
 
         typename CrsMatrixDevice::staticcrsgraph_type graph(dc, dr);
-        mat = CrsMatrixDevice("A", nrows_, ncols_, nnz, dv, graph);
+        mat = CrsMatrixDevice("A", ncols_, dv, graph);
     }
 };
 
