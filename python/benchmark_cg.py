@@ -269,8 +269,15 @@ def main():
     if not args.no_csv and rank == 0 and rows:
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         csv_path = RESULTS_DIR / f"cg_{ts}.csv"
+        all_keys = []
+        seen = set()
+        for row in rows:
+            for k in row.keys():
+                if k not in seen:
+                    all_keys.append(k)
+                    seen.add(k)
         with open(csv_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+            writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(rows)
         print(f"\n  Results saved to {csv_path}")
