@@ -120,19 +120,23 @@ def run_scipy_cpu(A: sp.csr_matrix, x: np.ndarray, repeat: int) -> dict:
 def run_jax_1gpu(A: sp.csr_matrix, x: np.ndarray, repeat: int) -> dict:
     if not HAS_JAX:
         return {}
-    A_bcoo = jsparse.BCOO.from_scipy_sparse(A)
-    x_jax  = jnp.array(x)
-    A_bcoo.block_until_ready()
-    x_jax.block_until_ready()
+    try:
+        A_bcoo = jsparse.BCOO.from_scipy_sparse(A)
+        x_jax  = jnp.array(x)
+        A_bcoo.block_until_ready()
+        x_jax.block_until_ready()
 
-    @jax.jit
-    def fn():
-        return A_bcoo @ x_jax
+        @jax.jit
+        def fn():
+            return A_bcoo @ x_jax
 
-    fn().block_until_ready()  # warmup compile
+        fn().block_until_ready()  # warmup compile
 
-    t = measure(lambda: fn().block_until_ready(), warmup=10, repeat=repeat)
-    return spmv_metrics(t, A.shape[0], A.nnz)
+        t = measure(lambda: fn().block_until_ready(), warmup=10, repeat=repeat)
+        return spmv_metrics(t, A.shape[0], A.nnz)
+    except Exception as e:
+        print(f"  [SKIP] jax_1gpu: {type(e).__name__}: {e}", file=sys.stderr)
+        return {}
 
 
 def run_kokkos_1gpu(A: sp.csr_matrix, x: np.ndarray, repeat: int,
@@ -172,22 +176,26 @@ def run_batch(A: sp.csr_matrix, k: int, repeat: int) -> dict:
 
 
 def run_batch_jax_loop(A: sp.csr_matrix, k: int, repeat: int) -> dict:
-    """Baseline: k separate JAX SpMVs in a Python loop."""
     if not HAS_JAX:
         return {}
-    A_bcoo = jsparse.BCOO.from_scipy_sparse(A)
-    X_jax  = jnp.ones((A.shape[1], k))
+    try:
+        A_bcoo = jsparse.BCOO.from_scipy_sparse(A)
+        X_jax  = jnp.ones((A.shape[1], k))
 
-    @jax.jit
-    def fn():
-        return jnp.stack([A_bcoo @ X_jax[:, i] for i in range(k)], axis=1)
+        @jax.jit
+        def fn():
+            return jnp.stack([A_bcoo @ X_jax[:, i] for i in range(k)], axis=1)
 
-    fn().block_until_ready()  # compile
+        fn().block_until_ready()  # compile
 
-    t = measure(lambda: fn().block_until_ready(), warmup=5, repeat=repeat)
-    metrics = spmv_metrics(t, A.shape[0], A.nnz, k=k)
-    metrics['k'] = k
-    return metrics
+        t = measure(lambda: fn().block_until_ready(), warmup=5, repeat=repeat)
+        metrics = spmv_metrics(t, A.shape[0], A.nnz, k=k)
+        metrics['k'] = k
+        return metrics
+    except Exception as e:
+        print(f"  [SKIP] jax_loop_k{k}: {type(e).__name__}: {e}", file=sys.stderr)
+        return {}
+
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
