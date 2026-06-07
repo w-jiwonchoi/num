@@ -155,7 +155,9 @@ def fig4_cg_vs_spmv_scaling(cg_df: pd.DataFrame, spmv_df: pd.DataFrame):
         sub = df[df.get('n_ranks', pd.Series([1] * len(df))).notna()].copy()
         if sub.empty:
             continue
-        sub['n_ranks'] = sub.get('n_ranks', 1).fillna(1).astype(int)
+        if 'n_ranks' not in sub.columns:
+            sub['n_ranks'] = 1
+        sub['n_ranks'] = sub['n_ranks'].fillna(1).astype(int)
         base = sub[sub['n_ranks'] == 1]['elapsed_s'].mean()
         if np.isnan(base):
             continue
