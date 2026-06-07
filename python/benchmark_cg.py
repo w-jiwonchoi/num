@@ -42,6 +42,17 @@ try:
 except ImportError:
     HAS_MPI = False
 
+# ─── Optional PETSc baseline ──────────────────────────────────────────────────
+# Install: conda install -c conda-forge petsc4py
+#       or: pip install "petsc4py @ ..."  (needs PETSc already installed)
+try:
+    import petsc4py
+    petsc4py.init(sys.argv)
+    from petsc4py import PETSc as _PETSc
+    HAS_PETSC = True
+except (ImportError, Exception):
+    HAS_PETSC = False
+
 from matrix_generators import get_matrix
 
 RESULTS_DIR = Path(__file__).parent.parent / "benchmark" / "results"
@@ -69,7 +80,6 @@ def wall_time(fn, repeat: int = 5) -> float:
 def bench_scipy_cg(A: sp.csr_matrix, b: np.ndarray,
                    tol: float, max_iter: int) -> dict:
     iters_box = [0]
-    calls = [0]
 
     def callback(xk):
         iters_box[0] += 1
@@ -85,6 +95,62 @@ def bench_scipy_cg(A: sp.csr_matrix, b: np.ndarray,
         'residual':  float(res),
         'converged': info == 0,
     }
+
+
+# ─── PETSc CG baseline ───────────────────────────────────────────────────────
+
+def bench_petsc_cg(A: sp.csr_matrix, b: np.ndarray,
+                   tol: float, max_iter: int) -> dict:
+    """
+    PETSc CG with no preconditioner (PCNONE), sequential (1-rank) run.
+    Requires petsc4py.  Falls back gracefully when unavailable.
+    """
+    if not HAS_PETSC:
+        return {}
+
+    PETSc = _PETSc
+    n = A.shape[0]
+
+    try:
+        # Build PETSc AIJ matrix from SciPy CSR data
+        A_p = PETSc.Mat().createAIJWithArrays(
+            size=A.shape,
+            csr=(A.indptr.astype('int32'),
+                 A.indices.astype('int32'),
+                 A.data.astype('float64')),
+        )
+        A_p.assemble()
+
+        b_p = PETSc.Vec().createSeq(n)
+        b_p.setArray(b)
+        b_p.assemble()
+
+        x_p = PETSc.Vec().createSeq(n)
+        x_p.set(0.0)
+
+        ksp = PETSc.KSP().create()
+        ksp.setOperators(A_p)
+        ksp.setType(PETSc.KSP.Type.CG)
+        ksp.setTolerances(rtol=tol, max_it=max_iter)
+        ksp.getPC().setType(PETSc.PC.Type.NONE)
+        ksp.setFromOptions()
+
+        t0 = time.perf_counter()
+        ksp.solve(b_p, x_p)
+        elapsed = time.perf_counter() - t0
+
+        x_np = x_p.getArray().copy()
+        res = float(np.linalg.norm(b - A @ x_np) / np.linalg.norm(b))
+        return {
+            'backend':   'petsc_cg',
+            'elapsed_s': elapsed,
+            'iters':     ksp.getIterationNumber(),
+            'residual':  res,
+            'converged': ksp.getConvergedReason() > 0,
+        }
+    except Exception as e:
+        print(f"  [WARN] petsc_cg failed: {e}", file=sys.stderr)
+        return {}
 
 
 # ─── KokkosSpMV local CG ─────────────────────────────────────────────────────
@@ -104,8 +170,7 @@ def bench_kspmv_cg_local(A: sp.csr_matrix, b: np.ndarray,
         x_gpu = cp.zeros(A.shape[0], dtype=cp.float64)
         return kspmv.cg_solve_local(A_gpu, b_gpu, x_gpu, tol=tol, max_iter=max_iter)
 
-    # Warmup
-    result = run()
+    result = run()   # warmup
     cuda_sync()
 
     t0 = time.perf_counter()
@@ -187,13 +252,15 @@ def bench_spmv_dist(A: sp.csr_matrix, rank: int, size: int,
     for _ in range(5):
         kspmv.dist_spmv(A_dist, x_local, y_local)
     cuda_sync()
-    if comm: comm.Barrier()
+    if comm:
+        comm.Barrier()
 
     t0 = time.perf_counter()
     for _ in range(repeat):
         kspmv.dist_spmv(A_dist, x_local, y_local)
     cuda_sync()
-    if comm: comm.Barrier()
+    if comm:
+        comm.Barrier()
     elapsed = (time.perf_counter() - t0) / repeat
 
     return {
@@ -216,6 +283,8 @@ def parse_args():
     p.add_argument('--tol',     type=float, default=1e-8)
     p.add_argument('--maxiter', type=int,   default=2000)
     p.add_argument('--no-csv',  action='store_true')
+    p.add_argument('--no-petsc', action='store_true',
+                   help='Skip PETSc CG even if petsc4py is available')
     return p.parse_args()
 
 
@@ -237,6 +306,11 @@ def main():
     if rank == 0:
         print(f"\nCG Benchmark — {args.matrix}  N={N:,}  nnz={nnz:,}"
               f"  tol={args.tol:.0e}  np={size}")
+        if HAS_PETSC and not args.no_petsc:
+            print("  (petsc_cg baseline enabled)")
+        elif not HAS_PETSC:
+            print("  (petsc_cg skipped — petsc4py not installed; "
+                  "see requirements.txt)")
         print("-" * 78)
         fmt = f"  {'Backend':<30} {'Time(s)':>9} {'Iters':>7} {'Residual':>12} Converged"
         print(fmt)
@@ -253,19 +327,24 @@ def main():
               f"{conv}")
         rows.append({'N': N, 'nnz': nnz, **m})
 
+    # ── Single-rank baselines (always on rank 0) ──────────────────────────
     if rank == 0:
         report(bench_scipy_cg(A, b, args.tol, args.maxiter))
+        if HAS_PETSC and not args.no_petsc:
+            report(bench_petsc_cg(A, b, args.tol, args.maxiter))
         report(bench_kspmv_cg_local(A, b, args.tol, args.maxiter))
 
+    # ── Distributed CG (all ranks participate) ────────────────────────────
     if size > 1:
         report(bench_kspmv_cg_dist(A, b, rank, size, args.tol, args.maxiter))
 
-    # SpMV alone (for scaling comparison)
+    # ── SpMV alone (for scaling comparison, Fig 4) ────────────────────────
     spmv_m = bench_spmv_dist(A, rank, size)
     if rank == 0 and spmv_m:
         spmv_m['backend'] = f'spmv_only_{size}gpu'
         report(spmv_m)
 
+    # ── CSV output ────────────────────────────────────────────────────────
     if not args.no_csv and rank == 0 and rows:
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         csv_path = RESULTS_DIR / f"cg_{ts}.csv"
