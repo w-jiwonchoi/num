@@ -135,7 +135,7 @@ def test_cg_local(N: int = 10_000):
         b = np.ones(A.shape[0], dtype=np.float64)
 
         # Reference (SciPy CG)
-        x_ref, info = spla.cg(A, b, tol=1e-12, maxiter=2000)
+        x_ref, info = spla.cg(A, b, rtol=1e-12, maxiter=2000)
         if info != 0:
             print(f"  [WARN] SciPy CG failed (info={info}) for {name}")
 
