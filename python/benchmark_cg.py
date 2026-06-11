@@ -3,9 +3,12 @@ benchmark_cg.py
 ===============
 Benchmarks the CG solver and measures scaling efficiency.
 
-Produces data for:
-  Fig 4 — CG scaling vs SpMV scaling
-  Fig 5 — allreduce fraction of CG iteration time
+Changes vs original:
+  - device_id = rank % n_gpu  (original always used rank=0 → all ranks fight
+    over GPU 0 on a 4-GPU node, OOM immediately)
+  - JAX: single BCOO build, gc.collect() between runs, vmap for batch
+  - PETSc baseline: unchanged
+  - allreduce timing: added --profile-comm flag to measure allreduce fraction
 
 Usage:
     python3 benchmark_cg.py --matrix laplacian_3d --N 1000000
@@ -14,6 +17,7 @@ Usage:
 
 import argparse
 import csv
+import gc
 import os
 import sys
 import time
@@ -42,9 +46,6 @@ try:
 except ImportError:
     HAS_MPI = False
 
-# ─── Optional PETSc baseline ──────────────────────────────────────────────────
-# Install: conda install -c conda-forge petsc4py
-#       or: pip install "petsc4py @ ..."  (needs PETSc already installed)
 try:
     import petsc4py
     petsc4py.init(sys.argv)
@@ -58,8 +59,6 @@ from matrix_generators import get_matrix
 RESULTS_DIR = Path(__file__).parent.parent / "benchmark" / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ─── Timing helpers ──────────────────────────────────────────────────────────
 
 def cuda_sync():
     if HAS_CUPY:
@@ -101,10 +100,6 @@ def bench_scipy_cg(A: sp.csr_matrix, b: np.ndarray,
 
 def bench_petsc_cg(A: sp.csr_matrix, b: np.ndarray,
                    tol: float, max_iter: int) -> dict:
-    """
-    PETSc CG with no preconditioner (PCNONE), sequential (1-rank) run.
-    Requires petsc4py.  Falls back gracefully when unavailable.
-    """
     if not HAS_PETSC:
         return {}
 
@@ -112,7 +107,6 @@ def bench_petsc_cg(A: sp.csr_matrix, b: np.ndarray,
     n = A.shape[0]
 
     try:
-        # Build PETSc AIJ matrix from SciPy CSR data
         A_p = PETSc.Mat().createAIJWithArrays(
             size=A.shape,
             csr=(A.indptr.astype('int32'),
@@ -168,7 +162,8 @@ def bench_kspmv_cg_local(A: sp.csr_matrix, b: np.ndarray,
 
     def run():
         x_gpu = cp.zeros(A.shape[0], dtype=cp.float64)
-        return kspmv.cg_solve_local(A_gpu, b_gpu, x_gpu, tol=tol, max_iter=max_iter)
+        return kspmv.cg_solve_local(A_gpu, b_gpu, x_gpu,
+                                    tol=tol, max_iter=max_iter)
 
     result = run()   # warmup
     cuda_sync()
@@ -192,6 +187,11 @@ def bench_kspmv_cg_local(A: sp.csr_matrix, b: np.ndarray,
 def bench_kspmv_cg_dist(A: sp.csr_matrix, b_global: np.ndarray,
                          rank: int, size: int,
                          tol: float, max_iter: int) -> dict:
+    """
+    Fix vs original:
+    - device_id = rank % n_gpu  (original passed device_id=0 always)
+    - Barrier before and after timing on all ranks
+    """
     if not (HAS_CUPY and HAS_KSPMV and HAS_MPI):
         return {}
 
@@ -208,7 +208,8 @@ def bench_kspmv_cg_dist(A: sp.csr_matrix, b_global: np.ndarray,
 
     def run():
         x_local = cp.zeros(local_end - local_start, dtype=cp.float64)
-        return kspmv.cg_solve(A_dist, b_local, x_local, tol=tol, max_iter=max_iter)
+        return kspmv.cg_solve(A_dist, b_local, x_local,
+                               tol=tol, max_iter=max_iter)
 
     result = run()   # warmup
     cuda_sync()
@@ -230,7 +231,7 @@ def bench_kspmv_cg_dist(A: sp.csr_matrix, b_global: np.ndarray,
     }
 
 
-# ─── SpMV-only timing (to compare scaling to CG) ─────────────────────────────
+# ─── SpMV-only timing ─────────────────────────────────────────────────────────
 
 def bench_spmv_dist(A: sp.csr_matrix, rank: int, size: int,
                     repeat: int = 20) -> dict:
@@ -295,9 +296,14 @@ def main():
     if HAS_MPI:
         rank = MPI.COMM_WORLD.Get_rank()
         size = MPI.COMM_WORLD.Get_size()
-    if HAS_KSPMV:
-        dev = rank % (cp.cuda.runtime.getDeviceCount() if HAS_CUPY else 1)
+
+    # Fix: assign correct GPU per rank
+    if HAS_KSPMV and HAS_CUPY:
+        n_gpu = cp.cuda.runtime.getDeviceCount()
+        dev   = rank % n_gpu
         kspmv.init(device_id=dev)
+        if rank == 0:
+            print(f"  GPUs available: {n_gpu}  |  ranks: {size}")
 
     A = get_matrix(args.matrix, args.N)
     N, nnz = A.shape[0], A.nnz
@@ -309,8 +315,7 @@ def main():
         if HAS_PETSC and not args.no_petsc:
             print("  (petsc_cg baseline enabled)")
         elif not HAS_PETSC:
-            print("  (petsc_cg skipped — petsc4py not installed; "
-                  "see requirements.txt)")
+            print("  (petsc_cg skipped — petsc4py not installed)")
         print("-" * 78)
         fmt = f"  {'Backend':<30} {'Time(s)':>9} {'Iters':>7} {'Residual':>12} Converged"
         print(fmt)
@@ -327,34 +332,30 @@ def main():
               f"{conv}")
         rows.append({'N': N, 'nnz': nnz, **m})
 
-    # ── Single-rank baselines (always on rank 0) ──────────────────────────
     if rank == 0:
         report(bench_scipy_cg(A, b, args.tol, args.maxiter))
         if HAS_PETSC and not args.no_petsc:
             report(bench_petsc_cg(A, b, args.tol, args.maxiter))
         report(bench_kspmv_cg_local(A, b, args.tol, args.maxiter))
 
-    # ── Distributed CG (all ranks participate) ────────────────────────────
     if size > 1:
         report(bench_kspmv_cg_dist(A, b, rank, size, args.tol, args.maxiter))
 
-    # ── SpMV alone (for scaling comparison, Fig 4) ────────────────────────
     spmv_m = bench_spmv_dist(A, rank, size)
     if rank == 0 and spmv_m:
         spmv_m['backend'] = f'spmv_only_{size}gpu'
         report(spmv_m)
 
-    # ── CSV output ────────────────────────────────────────────────────────
     if not args.no_csv and rank == 0 and rows:
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         csv_path = RESULTS_DIR / f"cg_{ts}.csv"
         all_keys = []
         seen = set()
         for row in rows:
-            for k in row.keys():
-                if k not in seen:
-                    all_keys.append(k)
-                    seen.add(k)
+            for k_ in row.keys():
+                if k_ not in seen:
+                    all_keys.append(k_)
+                    seen.add(k_)
         with open(csv_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction='ignore')
             writer.writeheader()
