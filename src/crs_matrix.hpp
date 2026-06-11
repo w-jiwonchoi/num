@@ -2,6 +2,7 @@
 #include <Kokkos_Core.hpp>
 #include <KokkosSparse_CrsMatrix.hpp>
 #include <vector>
+#include <memory>
 #include <stdexcept>
 
 // ─── Execution / memory space aliases ────────────────────────────────────────
@@ -36,9 +37,9 @@ using ViewMat2DConst = Kokkos::View<const Scalar**, Kokkos::LayoutRight, MemSpac
 // ─── Handle wrapping a device-side CSR matrix ─────────────────────────────────
 struct CrsMatrixHandle {
     CrsMatrixDevice mat;
-    int nrows;
-    int ncols;
-    int nnz;
+    int nrows = 0;
+    int ncols = 0;
+    int nnz   = 0;
 
     CrsMatrixHandle() = default;
 
@@ -85,30 +86,30 @@ struct GhostMap {
     int total_ghost = 0;
 };
 
-// ─── PackedSendInfo (forward declaration; defined in halo_exchange.hpp) ───────
-//
-//  We need the struct visible here so DistCrsHandle can hold it.
-//  Forward-declare only; halo_exchange.hpp defines it fully and is always
-//  included before any code that accesses the fields.
-struct PackedSendInfo;
+struct PackedSendInfo;   // defined in halo_exchange.hpp
 
 // ─── Distributed CSR matrix (one object per MPI rank) ────────────────────────
 //
-//  Added pack_info: pre-computed device-side send-index array.
-//  Built once in distribute_csr, reused every halo_exchange call.
-//  This eliminates the per-iteration setup overhead in the original code.
+//  v0.2 additions:
+//   - interior / boundary split matrices for communication-compute overlap.
+//     interior: rows touching ONLY local columns  (can run during halo comm)
+//     boundary: rows touching at least one ghost  (runs after halo completes)
+//   - x_ext_cache: extended-vector buffer allocated once per matrix, reused
+//     by every dist_spmv / CG iteration (was reallocated per call in v0.1).
 
 struct DistCrsHandle {
-    CrsMatrixHandle              local;
-    GhostMap                     ghost_map;
-    int                          global_nrows;
-    int                          local_row_start;
-    int                          local_row_end;
+    CrsMatrixHandle local;       // full local block (fallback / non-overlap)
+    CrsMatrixHandle interior;    // valid iff has_split
+    CrsMatrixHandle boundary;    // valid iff has_split
+    bool            has_split = false;
 
-    // ── Performance addition: cached device-side pack metadata ───────────
-    //  Stored as shared_ptr so DistCrsHandle is copyable (needed by Python
-    //  bindings which may copy the handle into Python objects).
-    std::shared_ptr<PackedSendInfo> pack_info;  // null until distribute_csr sets it
+    GhostMap        ghost_map;
+    int             global_nrows    = 0;
+    int             local_row_start = 0;
+    int             local_row_end   = 0;
+
+    std::shared_ptr<PackedSendInfo> pack_info;
+    std::shared_ptr<ViewVec1D>      x_ext_cache;   // size local+ghost
 
     DistCrsHandle() = default;
 };
