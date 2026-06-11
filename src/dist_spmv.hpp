@@ -143,9 +143,7 @@ void distributed_spmv(
 
     // Ghost subview — this is where halo_exchange writes
     // Subview is a non-owning view into the tail of x_ext
-    auto x_ghost = Kokkos::subview(
-        x_ext,
-        Kokkos::make_pair(local_nrows, local_nrows + n_ghost));
+    ViewVec1D x_ghost(x_ext.data() + local_nrows, n_ghost);
 
     // ── Halo exchange (packs x_local → sends → recvs into x_ghost) ────────
     if (A_dist.pack_info) {
