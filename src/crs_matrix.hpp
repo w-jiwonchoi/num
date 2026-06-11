@@ -42,10 +42,6 @@ struct CrsMatrixHandle {
 
     CrsMatrixHandle() = default;
 
-    /**
-     * Build from raw host arrays (values, col-indices, row-pointers).
-     * The arrays are copied to device memory.
-     */
     CrsMatrixHandle(const Scalar*  h_values,
                     const Ordinal* h_colind,
                     const Offset*  h_rowptr,
@@ -56,7 +52,6 @@ struct CrsMatrixHandle {
         if (nrows_ <= 0 || ncols_ <= 0)
             throw std::invalid_argument("CrsMatrixHandle: non-positive dimensions");
 
-        // Host views (unmanaged — just wrap pointers)
         using HViewVal = Kokkos::View<const Scalar*,  Kokkos::HostSpace,
                                       Kokkos::MemoryUnmanaged>;
         using HViewCol = Kokkos::View<const Ordinal*, Kokkos::HostSpace,
@@ -68,7 +63,6 @@ struct CrsMatrixHandle {
         HViewCol hc(h_colind, nnz);
         HViewRow hr(h_rowptr, nrows_ + 1);
 
-        // Allocate device storage and deep copy
         auto dv = Kokkos::create_mirror_view_and_copy(MemSpace{}, hv);
         auto dc = Kokkos::create_mirror_view_and_copy(MemSpace{}, hc);
         auto dr = Kokkos::create_mirror_view_and_copy(MemSpace{}, hr);
@@ -80,24 +74,41 @@ struct CrsMatrixHandle {
 
 // ─── Ghost map for distributed SpMV ──────────────────────────────────────────
 struct CommInfo {
-    int              rank;      ///< MPI rank to communicate with
-    std::vector<int> global_ids;///< Global column indices involved
-    int              offset;    ///< Byte offset into ghost buffer
+    int              rank;
+    std::vector<int> global_ids;
+    int              offset;
 };
 
 struct GhostMap {
-    std::vector<CommInfo> send;   ///< What this rank sends out
-    std::vector<CommInfo> recv;   ///< What this rank receives
-    int total_ghost = 0;          ///< Total # of ghost entries needed
+    std::vector<CommInfo> send;
+    std::vector<CommInfo> recv;
+    int total_ghost = 0;
 };
 
+// ─── PackedSendInfo (forward declaration; defined in halo_exchange.hpp) ───────
+//
+//  We need the struct visible here so DistCrsHandle can hold it.
+//  Forward-declare only; halo_exchange.hpp defines it fully and is always
+//  included before any code that accesses the fields.
+struct PackedSendInfo;
+
 // ─── Distributed CSR matrix (one object per MPI rank) ────────────────────────
+//
+//  Added pack_info: pre-computed device-side send-index array.
+//  Built once in distribute_csr, reused every halo_exchange call.
+//  This eliminates the per-iteration setup overhead in the original code.
+
 struct DistCrsHandle {
-    CrsMatrixHandle local;       ///< Local submatrix (own rows)
-    GhostMap        ghost_map;
-    int             global_nrows;///< Total rows across all ranks
-    int             local_row_start;
-    int             local_row_end;
+    CrsMatrixHandle              local;
+    GhostMap                     ghost_map;
+    int                          global_nrows;
+    int                          local_row_start;
+    int                          local_row_end;
+
+    // ── Performance addition: cached device-side pack metadata ───────────
+    //  Stored as shared_ptr so DistCrsHandle is copyable (needed by Python
+    //  bindings which may copy the handle into Python objects).
+    std::shared_ptr<PackedSendInfo> pack_info;  // null until distribute_csr sets it
 
     DistCrsHandle() = default;
 };
