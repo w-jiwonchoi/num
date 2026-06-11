@@ -122,7 +122,7 @@ struct DiagMatrix {
 
 /** Upload a host std::vector to device ViewVec1D. */
 ViewVec1D to_device(const std::vector<double>& h, const char* label = "v") {
-    ViewVec1D d(label, h.size());
+    ViewVec1D d(std::string(label), h.size());
     auto mirror = Kokkos::create_mirror_view(d);
     for (int i = 0; i < (int)h.size(); ++i) mirror(i) = h[i];
     Kokkos::deep_copy(d, mirror);
