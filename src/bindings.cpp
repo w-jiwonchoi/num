@@ -55,7 +55,6 @@ All GPU arrays are accepted zero-copy from CuPy / PyTorch / JAX (cuda device).
             Kokkos::InitializationSettings settings;
             settings.set_device_id(device_id);
             Kokkos::initialize(settings);
-            // Register finalizer so Python GC doesn't conflict
             std::atexit([]() {
                 if (Kokkos::is_initialized()) Kokkos::finalize();
             });
@@ -64,7 +63,7 @@ All GPU arrays are accepted zero-copy from CuPy / PyTorch / JAX (cuda device).
         return nb::make_tuple(mpi.rank(), mpi.size());
     }, "device_id"_a = 0,
     "Initialise Kokkos and MPI.  Returns (rank, size).  "
-    "Safe to call multiple times.");
+    "Safe to call multiple times.  Pass device_id = rank % n_gpu for multi-GPU.");
 
     m.def("finalize", []() {
         if (Kokkos::is_initialized()) Kokkos::finalize();
@@ -76,7 +75,7 @@ All GPU arrays are accepted zero-copy from CuPy / PyTorch / JAX (cuda device).
     m.def("barrier", []() { MPI_Barrier(MPIContext::instance().comm()); },
           "MPI_Barrier on COMM_WORLD.");
 
-    // ── CrsMatrixHandle (opaque Python object) ───────────────────────────────
+    // ── CrsMatrixHandle ───────────────────────────────────────────────────────
     nb::class_<CrsMatrixHandle>(m, "CrsMatrix",
         "Opaque handle to a device-side CSR matrix.")
         .def_ro("nrows", &CrsMatrixHandle::nrows)
@@ -142,11 +141,14 @@ CrsMatrix  Opaque GPU handle
                                   MPIContext::instance().comm());
         },
         "rowptr"_a, "colind"_a, "values"_a, "global_nrows"_a, "global_ncols"_a,
-        "Partition a CSR matrix across MPI ranks.  Each rank receives its "
-        "local submatrix as a DistCrsMatrix.");
+        R"(
+Partition a CSR matrix across MPI ranks.  Each rank receives its local
+submatrix.  Device-side send-index arrays are pre-built and cached so that
+subsequent dist_spmv calls do not repeat setup work.
+)");
 
 #if defined(KOKKOS_ENABLE_CUDA)
-    // ── spmv  (single GPU) ───────────────────────────────────────────────────
+    // ── spmv (single GPU) ────────────────────────────────────────────────────
     m.def("spmv",
         [](const CrsMatrixHandle& A,
            f64_1d_gpuc            x_nb,
@@ -154,11 +156,9 @@ CrsMatrix  Opaque GPU handle
            bool                   use_kokkoskernels)
         {
             if ((int)x_nb.shape(0) != A.ncols)
-                throw std::invalid_argument(
-                    "spmv: x length != A.ncols");
+                throw std::invalid_argument("spmv: x length != A.ncols");
             if ((int)y_nb.shape(0) != A.nrows)
-                throw std::invalid_argument(
-                    "spmv: y length != A.nrows");
+                throw std::invalid_argument("spmv: y length != A.nrows");
 
             ViewVec1DConst x(x_nb.data(), x_nb.shape(0));
             ViewVec1D      y(y_nb.data(), y_nb.shape(0));
@@ -178,10 +178,11 @@ A   : CrsMatrix   — GPU matrix handle
 x   : cuda float64 ndarray of shape (ncols,)
 y   : cuda float64 ndarray of shape (nrows,)  — output written here
 kokkoskernels : bool — if True, use KokkosKernels/cuSPARSE backend
-                       if False, use custom TeamPolicy kernel
+                       if False, use custom hierarchical TeamPolicy kernel
+                       (the custom kernel is auto-tuned by nnz/row)
 )");
 
-    // ── batch_spmv  (single GPU) ─────────────────────────────────────────────
+    // ── batch_spmv (single GPU) ──────────────────────────────────────────────
     m.def("batch_spmv",
         [](const CrsMatrixHandle& A,
            f64_2d_gpuc            X_nb,
@@ -191,8 +192,7 @@ kokkoskernels : bool — if True, use KokkosKernels/cuSPARSE backend
             if (N != A.ncols)
                 throw std::invalid_argument("batch_spmv: X.shape[0] != A.ncols");
             if ((int)Y_nb.shape(0) != A.nrows || (int)Y_nb.shape(1) != k)
-                throw std::invalid_argument(
-                    "batch_spmv: Y must be (A.nrows, k)");
+                throw std::invalid_argument("batch_spmv: Y must be (A.nrows, k)");
 
             ViewMat2DConst X(X_nb.data(), N, k);
             ViewMat2D      Y(Y_nb.data(), A.nrows, k);
@@ -202,13 +202,15 @@ kokkoskernels : bool — if True, use KokkosKernels/cuSPARSE backend
         R"(
 Batch SpMV: Y = A @ X  where X has shape (N, k).
 
-Processes k right-hand-side vectors simultaneously.  Significantly faster
-than k individual spmv calls when k >= 8, due to column-index cache reuse.
+Dispatch:
+  k < 4   → MDRangePolicy with correct tile orientation (inner dim = rhs)
+  4<=k<32 → TeamPolicy hierarchical (register accumulation per rhs column)
+  k >= 32 → KokkosKernels SPMM (cuSPARSE SpMM, fastest for large k)
 
 Parameters
 ----------
 A : CrsMatrix             — GPU matrix handle
-X : cuda float64 (N, k)  — input (row-major / C-contiguous)
+X : cuda float64 (N, k)  — input (C-contiguous / row-major)
 Y : cuda float64 (N, k)  — output written here
 )");
 
@@ -224,9 +226,16 @@ Y : cuda float64 (N, k)  — output written here
                              MPIContext::instance().comm());
         },
         "A_dist"_a, "x_local"_a, "y_local"_a,
-        "Distributed SpMV: y_local = A_dist @ x_global (via halo exchange).");
+        R"(
+Distributed SpMV: y_local = A_dist @ x_global (via GPU-packed halo exchange).
 
-    // ── cg_solve ─────────────────────────────────────────────────────────────
+Improvements vs v0.1:
+  - Send buffer packed on GPU (parallel_for over send indices)
+  - GPU-direct MPI when compiled with -DENABLE_CUDA_AWARE_MPI=ON
+  - x_ext allocation reused across calls when pack_info is cached
+)");
+
+    // ── cg_solve (distributed) ───────────────────────────────────────────────
     m.def("cg_solve",
         [](const DistCrsHandle& A_dist,
            f64_1d_gpuc          b_nb,
@@ -251,8 +260,8 @@ Y : cuda float64 (N, k)  — output written here
         R"(
 Distributed Conjugate Gradient solver for  A x = b.
 
-A must be symmetric positive definite.  x is used as the initial guess and
-overwritten with the solution on return.
+A must be symmetric positive definite.  x is the initial guess and is
+overwritten with the solution.
 
 Returns dict with keys:
   'iters'     : int   — iterations performed
@@ -260,7 +269,7 @@ Returns dict with keys:
   'converged' : bool  — True if tol was reached
 )");
 
-    // ── local cg_solve (single GPU, no MPI) ──────────────────────────────────
+    // ── cg_solve_local (single GPU) ──────────────────────────────────────────
     m.def("cg_solve_local",
         [](const CrsMatrixHandle& A,
            f64_1d_gpuc             b_nb,
