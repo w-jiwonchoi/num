@@ -122,15 +122,15 @@ def run_jax_1gpu(A, x, repeat):
         jax.block_until_ready(x_jax)
 
         @jax.jit
-        def fn():
-            return A_bcoo @ x_jax
+        def fn(matrix, vector):
+            return matrix @ vector
 
-        # warmup을 충분히 — 첫 호출은 컴파일, 이후 캐시 히트 구분
         for _ in range(5):
-            jax.block_until_ready(fn())
+            jax.block_until_ready(fn(A_bcoo, x_jax))
 
-        t = measure(lambda: jax.block_until_ready(fn()),
+        t = measure(lambda: jax.block_until_ready(fn(A_bcoo, x_jax)),
                     warmup=10, repeat=repeat)
+                    
         del A_bcoo, x_jax
         gc.collect()
         return spmv_metrics(t, A.shape[0], A.nnz)
