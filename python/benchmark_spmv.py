@@ -125,8 +125,12 @@ def run_jax_1gpu(A, x, repeat):
         def fn():
             return A_bcoo @ x_jax
 
-        jax.block_until_ready(fn())
-        t = measure(lambda: jax.block_until_ready(fn()), warmup=10, repeat=repeat)
+        # warmup을 충분히 — 첫 호출은 컴파일, 이후 캐시 히트 구분
+        for _ in range(5):
+            jax.block_until_ready(fn())
+
+        t = measure(lambda: jax.block_until_ready(fn()),
+                    warmup=10, repeat=repeat)
         del A_bcoo, x_jax
         gc.collect()
         return spmv_metrics(t, A.shape[0], A.nnz)
@@ -134,7 +138,6 @@ def run_jax_1gpu(A, x, repeat):
         print(f"  [SKIP] jax_1gpu: {type(e).__name__}: {e}", file=sys.stderr)
         gc.collect()
         return {}
-
 
 def run_kokkos_1gpu(A, x, repeat, kokkoskernels=True):
     if not (HAS_CUPY and HAS_KSPMV):
