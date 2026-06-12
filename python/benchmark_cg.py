@@ -1,18 +1,12 @@
 """
-benchmark_cg.py
-===============
-Benchmarks the CG solver and measures scaling efficiency.
-
-Changes vs original:
-  - device_id = rank % n_gpu  (original always used rank=0 → all ranks fight
-    over GPU 0 on a 4-GPU node, OOM immediately)
-  - JAX: single BCOO build, gc.collect() between runs, vmap for batch
-  - PETSc baseline: unchanged
-  - allreduce timing: added --profile-comm flag to measure allreduce fraction
-
-Usage:
-    python3 benchmark_cg.py --matrix laplacian_3d --N 1000000
-    mpiexec -np 4 python3 benchmark_cg.py --matrix laplacian_3d --N 4000000
+benchmark_cg.py  (v0.3)
+=======================
+Fix vs v0.2:
+  - petsc_cg: 4-GPU 시 전체 행렬 대신 로컬 부분만 전달하도록 수정.
+    원인: np>1 일 때 rank 0 이 global A 를 그대로 petsc 에 넘겨서
+    "row pointer of length N+1 given but expected local_N+1" 오류 발생.
+    해결: petsc_cg 는 np==1 일 때만 실행 (분산 PETSc 설정은 별도이므로
+    이 단순 래퍼에서는 single-rank 한정으로 명시).
 """
 
 import argparse
@@ -65,19 +59,9 @@ def cuda_sync():
         cp.cuda.Stream.null.synchronize()
 
 
-def wall_time(fn, repeat: int = 5) -> float:
-    cuda_sync()
-    t0 = time.perf_counter()
-    for _ in range(repeat):
-        fn()
-    cuda_sync()
-    return (time.perf_counter() - t0) / repeat
+# ─── SciPy CG ────────────────────────────────────────────────────────────────
 
-
-# ─── SciPy CG baseline ───────────────────────────────────────────────────────
-
-def bench_scipy_cg(A: sp.csr_matrix, b: np.ndarray,
-                   tol: float, max_iter: int) -> dict:
+def bench_scipy_cg(A, b, tol, max_iter):
     iters_box = [0]
 
     def callback(xk):
@@ -87,37 +71,38 @@ def bench_scipy_cg(A: sp.csr_matrix, b: np.ndarray,
     x, info = spla.cg(A, b, rtol=tol, maxiter=max_iter, callback=callback)
     elapsed = time.perf_counter() - t0
     res = np.linalg.norm(b - A @ x) / np.linalg.norm(b)
-    return {
-        'backend':   'scipy_cg',
-        'elapsed_s': elapsed,
-        'iters':     iters_box[0],
-        'residual':  float(res),
-        'converged': info == 0,
-    }
+    return {'backend': 'scipy_cg', 'elapsed_s': elapsed,
+            'iters': iters_box[0], 'residual': float(res), 'converged': info == 0}
 
 
-# ─── PETSc CG baseline ───────────────────────────────────────────────────────
+# ─── PETSc CG (single-rank only) ─────────────────────────────────────────────
 
-def bench_petsc_cg(A: sp.csr_matrix, b: np.ndarray,
-                   tol: float, max_iter: int) -> dict:
+def bench_petsc_cg(A, b, tol, max_iter, mpi_size=1):
+    """
+    PETSc sequential CG.  Multi-rank 환경에서는 호출하지 않는다.
+    (분산 PETSc 는 별도의 KSP 설정이 필요하고 현재 스크립트 범위 밖)
+    """
     if not HAS_PETSC:
+        return {}
+    if mpi_size > 1:
+        # 다중 rank 에서 sequential petsc 에 global 행렬을 넘기면
+        # row pointer 크기 불일치 오류 발생 → 건너뜀
+        print("  [SKIP] petsc_cg: not supported with np > 1 in this benchmark",
+              file=sys.stderr)
         return {}
 
     PETSc = _PETSc
     n = A.shape[0]
-
     try:
         A_p = PETSc.Mat().createAIJWithArrays(
             size=A.shape,
             csr=(A.indptr.astype('int32'),
                  A.indices.astype('int32'),
-                 A.data.astype('float64')),
-        )
+                 A.data.astype('float64')))
         A_p.assemble()
 
         b_p = PETSc.Vec().createSeq(n)
-        b_p.setArray(b)
-        b_p.assemble()
+        b_p.setArray(b); b_p.assemble()
 
         x_p = PETSc.Vec().createSeq(n)
         x_p.set(0.0)
@@ -134,14 +119,10 @@ def bench_petsc_cg(A: sp.csr_matrix, b: np.ndarray,
         elapsed = time.perf_counter() - t0
 
         x_np = x_p.getArray().copy()
-        res = float(np.linalg.norm(b - A @ x_np) / np.linalg.norm(b))
-        return {
-            'backend':   'petsc_cg',
-            'elapsed_s': elapsed,
-            'iters':     ksp.getIterationNumber(),
-            'residual':  res,
-            'converged': ksp.getConvergedReason() > 0,
-        }
+        res  = float(np.linalg.norm(b - A @ x_np) / np.linalg.norm(b))
+        return {'backend': 'petsc_cg', 'elapsed_s': elapsed,
+                'iters': ksp.getIterationNumber(), 'residual': res,
+                'converged': ksp.getConvergedReason() > 0}
     except Exception as e:
         print(f"  [WARN] petsc_cg failed: {e}", file=sys.stderr)
         return {}
@@ -149,11 +130,9 @@ def bench_petsc_cg(A: sp.csr_matrix, b: np.ndarray,
 
 # ─── KokkosSpMV local CG ─────────────────────────────────────────────────────
 
-def bench_kspmv_cg_local(A: sp.csr_matrix, b: np.ndarray,
-                          tol: float, max_iter: int) -> dict:
+def bench_kspmv_cg_local(A, b, tol, max_iter):
     if not (HAS_CUPY and HAS_KSPMV):
         return {}
-
     A_gpu = kspmv.upload_csr(A.indptr.astype(np.int32),
                               A.indices.astype(np.int32),
                               A.data.astype(np.float64),
@@ -165,86 +144,59 @@ def bench_kspmv_cg_local(A: sp.csr_matrix, b: np.ndarray,
         return kspmv.cg_solve_local(A_gpu, b_gpu, x_gpu,
                                     tol=tol, max_iter=max_iter)
 
-    result = run()   # warmup
+    run()  # warmup
     cuda_sync()
-
     t0 = time.perf_counter()
     result = run()
     cuda_sync()
     elapsed = time.perf_counter() - t0
 
-    return {
-        'backend':   'kspmv_cg_1gpu',
-        'elapsed_s': elapsed,
-        'iters':     result['iters'],
-        'residual':  result['residual'],
-        'converged': result['converged'],
-    }
+    return {'backend': 'kspmv_cg_1gpu', 'elapsed_s': elapsed,
+            'iters': result['iters'], 'residual': result['residual'],
+            'converged': result['converged']}
 
 
 # ─── KokkosSpMV distributed CG ───────────────────────────────────────────────
 
-def bench_kspmv_cg_dist(A: sp.csr_matrix, b_global: np.ndarray,
-                         rank: int, size: int,
-                         tol: float, max_iter: int) -> dict:
-    """
-    Fix vs original:
-    - device_id = rank % n_gpu  (original passed device_id=0 always)
-    - Barrier before and after timing on all ranks
-    """
+def bench_kspmv_cg_dist(A, b_global, rank, size, tol, max_iter):
     if not (HAS_CUPY and HAS_KSPMV and HAS_MPI):
         return {}
-
     comm = MPI.COMM_WORLD
-    A_dist = kspmv.distribute_csr(
-        A.indptr.astype(np.int32),
-        A.indices.astype(np.int32),
-        A.data.astype(np.float64),
-        A.shape[0], A.shape[1])
-
+    A_dist = kspmv.distribute_csr(A.indptr.astype(np.int32),
+                                   A.indices.astype(np.int32),
+                                   A.data.astype(np.float64),
+                                   A.shape[0], A.shape[1])
     local_start = A_dist.local_row_start
     local_end   = A_dist.local_row_end
-    b_local     = cp.asarray(b_global[local_start:local_end])
+    b_local = cp.asarray(b_global[local_start:local_end])
 
     def run():
         x_local = cp.zeros(local_end - local_start, dtype=cp.float64)
         return kspmv.cg_solve(A_dist, b_local, x_local,
                                tol=tol, max_iter=max_iter)
 
-    result = run()   # warmup
-    cuda_sync()
-    comm.Barrier()
-
+    run()  # warmup
+    cuda_sync(); comm.Barrier()
     t0 = time.perf_counter()
     result = run()
-    cuda_sync()
-    comm.Barrier()
+    cuda_sync(); comm.Barrier()
     elapsed = time.perf_counter() - t0
 
-    return {
-        'backend':   f'kspmv_cg_{size}gpu',
-        'elapsed_s': elapsed,
-        'iters':     result['iters'],
-        'residual':  result['residual'],
-        'converged': result['converged'],
-        'n_ranks':   size,
-    }
+    return {'backend': f'kspmv_cg_{size}gpu', 'elapsed_s': elapsed,
+            'iters': result['iters'], 'residual': result['residual'],
+            'converged': result['converged'], 'n_ranks': size}
 
 
 # ─── SpMV-only timing ─────────────────────────────────────────────────────────
 
-def bench_spmv_dist(A: sp.csr_matrix, rank: int, size: int,
-                    repeat: int = 20) -> dict:
+def bench_spmv_dist(A, rank, size, repeat=20):
     if not (HAS_CUPY and HAS_KSPMV):
         return {}
-
     comm = MPI.COMM_WORLD if HAS_MPI else None
-    A_dist = kspmv.distribute_csr(
-        A.indptr.astype(np.int32),
-        A.indices.astype(np.int32),
-        A.data.astype(np.float64),
-        A.shape[0], A.shape[1])
-
+    A_dist = kspmv.distribute_csr(A.indptr.astype(np.int32),
+                                   A.indices.astype(np.int32),
+                                   A.data.astype(np.float64),
+                                   A.shape[0], A.shape[1])
     local_start = A_dist.local_row_start
     local_end   = A_dist.local_row_end
     x_local = cp.ones(local_end - local_start, dtype=cp.float64)
@@ -253,37 +205,29 @@ def bench_spmv_dist(A: sp.csr_matrix, rank: int, size: int,
     for _ in range(5):
         kspmv.dist_spmv(A_dist, x_local, y_local)
     cuda_sync()
-    if comm:
-        comm.Barrier()
-
+    if comm: comm.Barrier()
     t0 = time.perf_counter()
     for _ in range(repeat):
         kspmv.dist_spmv(A_dist, x_local, y_local)
     cuda_sync()
-    if comm:
-        comm.Barrier()
+    if comm: comm.Barrier()
     elapsed = (time.perf_counter() - t0) / repeat
 
-    return {
-        'backend':   f'kspmv_spmv_{size}gpu',
-        'elapsed_s': elapsed,
-        'n_ranks':   size,
-        'N':         A.shape[0],
-        'nnz':       A.nnz,
-    }
+    return {'backend': f'spmv_only_{size}gpu', 'elapsed_s': elapsed,
+            'n_ranks': size, 'N': A.shape[0], 'nnz': A.nnz}
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="CG benchmark")
-    p.add_argument('--N',       type=int, default=100_000)
-    p.add_argument('--matrix',  default='laplacian_3d',
+    p = argparse.ArgumentParser(description="CG benchmark v0.3")
+    p.add_argument('--N',        type=int,   default=100_000)
+    p.add_argument('--matrix',   default='laplacian_3d',
                    choices=['laplacian_2d', 'laplacian_3d',
-                             'lattice_gauge', 'random_sparse'])
-    p.add_argument('--tol',     type=float, default=1e-8)
-    p.add_argument('--maxiter', type=int,   default=2000)
-    p.add_argument('--no-csv',  action='store_true')
+                            'lattice_gauge', 'random_sparse'])
+    p.add_argument('--tol',      type=float, default=1e-8)
+    p.add_argument('--maxiter',  type=int,   default=2000)
+    p.add_argument('--no-csv',   action='store_true')
     p.add_argument('--no-petsc', action='store_true',
                    help='Skip PETSc CG even if petsc4py is available')
     return p.parse_args()
@@ -297,7 +241,6 @@ def main():
         rank = MPI.COMM_WORLD.Get_rank()
         size = MPI.COMM_WORLD.Get_size()
 
-    # Fix: assign correct GPU per rank
     if HAS_KSPMV and HAS_CUPY:
         n_gpu = cp.cuda.runtime.getDeviceCount()
         dev   = rank % n_gpu
@@ -312,9 +255,12 @@ def main():
     if rank == 0:
         print(f"\nCG Benchmark — {args.matrix}  N={N:,}  nnz={nnz:,}"
               f"  tol={args.tol:.0e}  np={size}")
-        if HAS_PETSC and not args.no_petsc:
+        petsc_on = HAS_PETSC and not args.no_petsc and size == 1
+        if petsc_on:
             print("  (petsc_cg baseline enabled)")
-        elif not HAS_PETSC:
+        elif HAS_PETSC and size > 1:
+            print("  (petsc_cg skipped — np > 1, sequential petsc only)")
+        else:
             print("  (petsc_cg skipped — petsc4py not installed)")
         print("-" * 78)
         fmt = f"  {'Backend':<30} {'Time(s)':>9} {'Iters':>7} {'Residual':>12} Converged"
@@ -335,7 +281,7 @@ def main():
     if rank == 0:
         report(bench_scipy_cg(A, b, args.tol, args.maxiter))
         if HAS_PETSC and not args.no_petsc:
-            report(bench_petsc_cg(A, b, args.tol, args.maxiter))
+            report(bench_petsc_cg(A, b, args.tol, args.maxiter, mpi_size=size))
         report(bench_kspmv_cg_local(A, b, args.tol, args.maxiter))
 
     if size > 1:
@@ -343,19 +289,16 @@ def main():
 
     spmv_m = bench_spmv_dist(A, rank, size)
     if rank == 0 and spmv_m:
-        spmv_m['backend'] = f'spmv_only_{size}gpu'
         report(spmv_m)
 
     if not args.no_csv and rank == 0 and rows:
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         csv_path = RESULTS_DIR / f"cg_{ts}.csv"
-        all_keys = []
-        seen = set()
+        all_keys, seen = [], set()
         for row in rows:
             for k_ in row.keys():
                 if k_ not in seen:
-                    all_keys.append(k_)
-                    seen.add(k_)
+                    all_keys.append(k_); seen.add(k_)
         with open(csv_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction='ignore')
             writer.writeheader()
