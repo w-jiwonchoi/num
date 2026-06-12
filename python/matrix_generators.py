@@ -174,58 +174,56 @@ def make_random_sparse(N: int, nnz_per_row: int = 10,
 
 def make_power_law(N: int, m: int = 3,
                    rng: Optional[np.random.Generator] = None) -> sp.csr_matrix:
-    seed = None
-    if rng is not None:
-        seed = int(rng.integers(0, 2**31))
-    
+    if rng is None:
+        rng = np.random.default_rng(1)
+        
     try:
         import networkx as nx
+        seed = int(rng.integers(0, 2**31))
         G = nx.barabasi_albert_graph(N, m, seed=seed)
         A = nx.to_scipy_sparse_array(G, format='csr', dtype=np.float64)
-        # Graph Laplacian: D - A
         A.data[:] = -1.0
         d = np.abs(A).sum(axis=1).A1
         L = sp.diags(d) - A
         return L.tocsr()
     except ImportError:
         pass
+        
+    # networkx가 없을 경우를 위한 고속 O(N) Barabasi-Albert 구현
+    repeated_nodes = np.zeros(2 * m * N, dtype=np.int32)
+    edges = []
     
-    # networkx 없을 경우 vectorized fallback (Vose alias method 근사)
-    if rng is None:
-        rng = np.random.default_rng(1)
-    
-    edges = set()
-    degrees = np.zeros(N, dtype=np.int64)
     seed_n = min(m + 1, N)
+    idx = 0
     for i in range(seed_n):
-        for j in range(i):
-            edges.add((i, j))
-            degrees[i] += 1
-            degrees[j] += 1
-    
-    # vectorized: node를 배치로 처리
-    batch = 10000
-    for start in range(seed_n, N, batch):
-        end = min(start + batch, N)
-        for node in range(start, end):
-            deg_sum = degrees[:node].sum()
-            n_targets = min(m, node)
-            if deg_sum == 0 or n_targets == 0:
-                continue
-            p = degrees[:node].astype(np.float64)
-            p /= p.sum()
-            targets = rng.choice(node, size=n_targets, replace=False, p=p)
-            for t in targets:
-                edges.add((node, t))
-                degrees[node] += 1
-                degrees[t] += 1
-    
+        for j in range(i + 1, seed_n):
+            edges.append((i, j))
+            repeated_nodes[idx] = i
+            idx += 1
+            repeated_nodes[idx] = j
+            idx += 1
+
+    for i in range(seed_n, N):
+        targets = set()
+        # 중복 없는 타겟 m개 선택
+        while len(targets) < m and len(targets) < i:
+            r = rng.integers(0, idx)
+            targets.add(repeated_nodes[r])
+            
+        for t in targets:
+            edges.append((i, t))
+            repeated_nodes[idx] = i
+            idx += 1
+            repeated_nodes[idx] = t
+            idx += 1
+            
     if not edges:
         return sp.eye(N, format='csr', dtype=np.float64)
-    
-    r, c = zip(*[(u, v) for u, v in edges])
-    rows = list(r) + list(c)
-    cols = list(c) + list(r)
+
+    r_idx = [u for u, v in edges]
+    c_idx = [v for u, v in edges]
+    rows = r_idx + c_idx
+    cols = c_idx + r_idx
     A = sp.csr_matrix(([-1.0]*len(rows), (rows, cols)), shape=(N, N), dtype=np.float64)
     d = np.abs(A).sum(axis=1).A1
     return (sp.diags(d) - A).tocsr()
