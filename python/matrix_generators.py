@@ -174,51 +174,61 @@ def make_random_sparse(N: int, nnz_per_row: int = 10,
 
 def make_power_law(N: int, m: int = 3,
                    rng: Optional[np.random.Generator] = None) -> sp.csr_matrix:
-    """
-    Barabási–Albert preferential attachment graph (power-law degree distribution).
-    Mimics social network / GNN adjacency matrices.
-    Returns the graph Laplacian (SPD).
-
-    N : number of nodes
-    m : edges added per node in BA construction
-    """
+    seed = None
+    if rng is not None:
+        seed = int(rng.integers(0, 2**31))
+    
+    try:
+        import networkx as nx
+        G = nx.barabasi_albert_graph(N, m, seed=seed)
+        A = nx.to_scipy_sparse_array(G, format='csr', dtype=np.float64)
+        # Graph Laplacian: D - A
+        A.data[:] = -1.0
+        d = np.abs(A).sum(axis=1).A1
+        L = sp.diags(d) - A
+        return L.tocsr()
+    except ImportError:
+        pass
+    
+    # networkx 없을 경우 vectorized fallback (Vose alias method 근사)
     if rng is None:
         rng = np.random.default_rng(1)
-
-    # Simple BA construction
+    
     edges = set()
     degrees = np.zeros(N, dtype=np.int64)
-
-    # Seed with a small clique
-    seed = min(m + 1, N)
-    for i in range(seed):
+    seed_n = min(m + 1, N)
+    for i in range(seed_n):
         for j in range(i):
             edges.add((i, j))
             degrees[i] += 1
             degrees[j] += 1
-
-    for node in range(seed, N):
-        deg_sum = degrees[:node].sum()
-        if deg_sum == 0:
-            targets = rng.choice(node, size=min(m, node), replace=False)
-        else:
-            p = degrees[:node] / deg_sum
-            targets = rng.choice(node, size=min(m, node), replace=False, p=p)
-        for t in targets:
-            edges.add((node, t))
-            degrees[node] += 1
-            degrees[t]    += 1
-
-    rows, cols = zip(*[(u, v) for u, v in edges]) if edges else ([], [])
-    rows = list(rows) + list(cols)
-    cols = list(cols) + list(rows[:len(edges)])
-    vals = [-1.0] * len(rows)
-
-    A = sp.csr_matrix((vals, (rows, cols)), shape=(N, N), dtype=np.float64)
-    # Graph Laplacian: D - A
+    
+    # vectorized: node를 배치로 처리
+    batch = 10000
+    for start in range(seed_n, N, batch):
+        end = min(start + batch, N)
+        for node in range(start, end):
+            deg_sum = degrees[:node].sum()
+            n_targets = min(m, node)
+            if deg_sum == 0 or n_targets == 0:
+                continue
+            p = degrees[:node].astype(np.float64)
+            p /= p.sum()
+            targets = rng.choice(node, size=n_targets, replace=False, p=p)
+            for t in targets:
+                edges.add((node, t))
+                degrees[node] += 1
+                degrees[t] += 1
+    
+    if not edges:
+        return sp.eye(N, format='csr', dtype=np.float64)
+    
+    r, c = zip(*[(u, v) for u, v in edges])
+    rows = list(r) + list(c)
+    cols = list(c) + list(r)
+    A = sp.csr_matrix(([-1.0]*len(rows), (rows, cols)), shape=(N, N), dtype=np.float64)
     d = np.abs(A).sum(axis=1).A1
-    L = sp.diags(d) - A
-    return L.tocsr()
+    return (sp.diags(d) - A).tocsr()
 
 
 # ─── Registry ─────────────────────────────────────────────────────────────────
