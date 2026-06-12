@@ -176,32 +176,47 @@ inline void distributed_spmv(
                             && A_dist.pack_info;
 
     if (do_overlap) {
-        // ── Overlapped path ────────────────────────────────────────────────
-        std::vector<MPI_Request> reqs;
-        reqs.reserve(A_dist.ghost_map.recv.size()
-                   + A_dist.ghost_map.send.size());
-
-        // 1. pack + post Isend/Irecv (pack fences internally)
-        halo_exchange_begin(x_local, A_dist.ghost_map, comm,
-                            *A_dist.pack_info, reqs);
-
-        // 2. interior SpMV — reads only x_ext[0..local_nrows), runs on GPU
-        //    while MPI moves halo data.  No fence here on purpose.
-        KokkosSparse::spmv("N", static_cast<Scalar>(1.0),
-                           A_dist.interior.mat, x_ext_const,
-                           static_cast<Scalar>(0.0), y_local);
-
-        // 3. complete halo, scatter ghosts into x_ext tail
-        halo_exchange_end(x_ghost, A_dist.ghost_map,
-                          *A_dist.pack_info, reqs);
-
-        // 4. boundary SpMV accumulates on top (beta = 1)
-        KokkosSparse::spmv("N", static_cast<Scalar>(1.0),
-                           A_dist.boundary.mat, x_ext_const,
-                           static_cast<Scalar>(1.0), y_local);
-        Kokkos::fence("dist_spmv_overlap_done");
-
-    } else {
+            // ── Overlapped path ────────────────────────────────────────────────
+            std::vector<MPI_Request> reqs;
+            reqs.reserve(A_dist.ghost_map.recv.size()
+                       + A_dist.ghost_map.send.size());
+    
+            // 1. pack + post Isend/Irecv
+            halo_exchange_begin(x_local, A_dist.ghost_map, comm,
+                                *A_dist.pack_info, reqs);
+    
+            // 2. interior SpMV
+            if (use_kokkoskernels) {
+                KokkosSparse::spmv("N", static_cast<Scalar>(1.0),
+                                   A_dist.interior.mat, x_ext_const,
+                                   static_cast<Scalar>(0.0), y_local);
+            } else {
+                launch_spmv_custom(A_dist.interior.mat, x_ext_const, y_local);
+            }
+    
+            // 3. complete halo
+            halo_exchange_end(x_ghost, A_dist.ghost_map,
+                              *A_dist.pack_info, reqs);
+    
+            // 4. boundary SpMV accumulates on top
+            if (use_kokkoskernels) {
+                KokkosSparse::spmv("N", static_cast<Scalar>(1.0),
+                                   A_dist.boundary.mat, x_ext_const,
+                                   static_cast<Scalar>(1.0), y_local);
+            } else {
+                // 커스텀 커널에 beta 누적 기능이 없다면 임시 벡터를 만들어 합칩니다.
+                ViewVec1D y_bnd("y_bnd", y_local.extent(0));
+                launch_spmv_custom(A_dist.boundary.mat, x_ext_const, y_bnd);
+                
+                Kokkos::parallel_for("accumulate_bnd",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(0, y_local.extent(0)),
+                    KOKKOS_LAMBDA(const int i) {
+                        y_local(i) += y_bnd(i);
+                    });
+            }
+            Kokkos::fence("dist_spmv_overlap_done");
+    
+        } else {
         // ── Blocking path (also used when np == 1 or no split) ────────────
         if (n_ghost > 0 && A_dist.pack_info)
             halo_exchange(x_local, x_ghost, A_dist.ghost_map,
