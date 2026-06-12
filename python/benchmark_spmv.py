@@ -1,19 +1,11 @@
 """
-benchmark_spmv.py  (v0.2)
+benchmark_spmv.py  (v0.3)
 =========================
-SpMV / Batch-SpMV / Distributed-SpMV throughput, all backends.
-
-New vs v0.1:
-  - Distributed runs measure BOTH local kernels →  kk_{np}gpu / custom_{np}gpu
-    (fills the kk_2gpu / kk_4gpu gap from the slide deck)
-  - --no-overlap to quantify comm/compute overlap gain (dist_noovl_{np}gpu)
-  - --batch-sweep for k ∈ {8,32,128,...}
-  - all 5 sparsity patterns supported, --matrix all
-  - CSV rows tagged with matrix, n_ranks, k, overlap, cuda_aware
-
-Usage:
-    python3 benchmark_spmv.py --N 1000000 --matrix all --batch-sweep 8 32 128
-    mpiexec -np 4 python3 benchmark_spmv.py --N 4000000 --backend kokkos_dist
+변경 vs v0.2:
+  - custom_batch 백엔드 추가 (template-unrolled kernel)
+  - batch sweep 기본값에 256, 512 포함
+  - dist 측정 시 --no-overlap 없어도 noovl 항상 측정 (4GPU 역성장 분석용)
+  - run_kokkos_dist 에서 noovl 경로를 별도 함수로 분리
 """
 
 import argparse
@@ -44,8 +36,10 @@ except ImportError:
 try:
     import kokkos_spmv as kspmv
     HAS_KSPMV = True
+    HAS_CUSTOM_BATCH = hasattr(kspmv, 'custom_batch_spmv')
 except ImportError:
     HAS_KSPMV = False
+    HAS_CUSTOM_BATCH = False
 
 try:
     from mpi4py import MPI
@@ -60,6 +54,8 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 ALL_MATRICES = ['laplacian_2d', 'laplacian_3d', 'lattice_gauge',
                 'random_sparse', 'power_law']
+
+DEFAULT_BATCH_SWEEP = [8, 32, 128, 256, 512]
 
 
 class Timer:
@@ -119,7 +115,6 @@ def run_jax_1gpu(A, x, repeat):
         A_bcoo = jsparse.BCOO.from_scipy_sparse(A)
         x_jax  = jnp.array(x)
         jax.block_until_ready(A_bcoo.data)
-        jax.block_until_ready(x_jax)
 
         @jax.jit
         def fn(matrix, vector):
@@ -127,10 +122,8 @@ def run_jax_1gpu(A, x, repeat):
 
         for _ in range(5):
             jax.block_until_ready(fn(A_bcoo, x_jax))
-
         t = measure(lambda: jax.block_until_ready(fn(A_bcoo, x_jax)),
                     warmup=10, repeat=repeat)
-                    
         del A_bcoo, x_jax
         gc.collect()
         return spmv_metrics(t, A.shape[0], A.nnz)
@@ -139,13 +132,14 @@ def run_jax_1gpu(A, x, repeat):
         gc.collect()
         return {}
 
+
 def run_kokkos_1gpu(A, x, repeat, kokkoskernels=True):
     if not (HAS_CUPY and HAS_KSPMV):
         return {}
     A_gpu = kspmv.upload_csr(A.indptr.astype(np.int32),
-                             A.indices.astype(np.int32),
-                             A.data.astype(np.float64),
-                             A.shape[0], A.shape[1])
+                              A.indices.astype(np.int32),
+                              A.data.astype(np.float64),
+                              A.shape[0], A.shape[1])
     x_gpu = cp.asarray(x)
     y_gpu = cp.zeros(A.shape[0], dtype=cp.float64)
     t = measure(lambda: kspmv.spmv(A_gpu, x_gpu, y_gpu,
@@ -161,12 +155,10 @@ def run_kokkos_dist(A, rank, size, repeat=50,
     if not (HAS_CUPY and HAS_KSPMV and HAS_MPI):
         return {}
     comm = MPI.COMM_WORLD
-    A_dist = kspmv.distribute_csr(
-        A.indptr.astype(np.int32),
-        A.indices.astype(np.int32),
-        A.data.astype(np.float64),
-        A.shape[0], A.shape[1])
-
+    A_dist = kspmv.distribute_csr(A.indptr.astype(np.int32),
+                                   A.indices.astype(np.int32),
+                                   A.data.astype(np.float64),
+                                   A.shape[0], A.shape[1])
     local_start = A_dist.local_row_start
     local_end   = A_dist.local_row_end
     x_local = cp.ones(local_end - local_start, dtype=cp.float64)
@@ -197,16 +189,35 @@ def run_kokkos_dist(A, rank, size, repeat=50,
 # ─── Batch backends ───────────────────────────────────────────────────────────
 
 def run_batch(A, k, repeat):
+    """KokkosKernels batch (기존 경로)."""
     if not (HAS_CUPY and HAS_KSPMV):
         return {}
     N = A.shape[1]
     A_gpu = kspmv.upload_csr(A.indptr.astype(np.int32),
-                             A.indices.astype(np.int32),
-                             A.data.astype(np.float64),
-                             A.shape[0], A.shape[1])
+                              A.indices.astype(np.int32),
+                              A.data.astype(np.float64),
+                              A.shape[0], A.shape[1])
     X_gpu = cp.random.standard_normal((N, k), dtype=cp.float64)
     Y_gpu = cp.zeros((A.shape[0], k), dtype=cp.float64)
     t = measure(lambda: kspmv.batch_spmv(A_gpu, X_gpu, Y_gpu),
+                warmup=10, repeat=repeat)
+    m = spmv_metrics(t, A.shape[0], A.nnz, k=k)
+    m['k'] = k
+    return m
+
+
+def run_custom_batch(A, k, repeat):
+    """Template-unrolled custom batch (새 경로)."""
+    if not (HAS_CUPY and HAS_KSPMV and HAS_CUSTOM_BATCH):
+        return {}
+    N = A.shape[1]
+    A_gpu = kspmv.upload_csr(A.indptr.astype(np.int32),
+                              A.indices.astype(np.int32),
+                              A.data.astype(np.float64),
+                              A.shape[0], A.shape[1])
+    X_gpu = cp.random.standard_normal((N, k), dtype=cp.float64)
+    Y_gpu = cp.zeros((A.shape[0], k), dtype=cp.float64)
+    t = measure(lambda: kspmv.custom_batch_spmv(A_gpu, X_gpu, Y_gpu),
                 warmup=10, repeat=repeat)
     m = spmv_metrics(t, A.shape[0], A.nnz, k=k)
     m['k'] = k
@@ -243,19 +254,19 @@ def run_batch_jax(A, k, repeat):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="SpMV benchmark v0.2")
+    p = argparse.ArgumentParser(description="SpMV benchmark v0.3")
     p.add_argument('--N',      type=int, default=100_000)
     p.add_argument('--matrix', default='laplacian_3d',
                    choices=ALL_MATRICES + ['all'])
     p.add_argument('--batch',  type=int, default=0)
     p.add_argument('--batch-sweep', type=int, nargs='*', default=None,
-                   help='Run batch SpMV for each k in this list')
+                   help='batch k 리스트 (기본: 8 32 128 256 512)')
     p.add_argument('--repeat', type=int, default=100)
     p.add_argument('--backend', nargs='+',
                    default=['scipy', 'jax', 'kokkos', 'kokkos_custom',
                             'kokkos_dist'])
     p.add_argument('--no-overlap', action='store_true',
-                   help='Also benchmark dist SpMV with overlap disabled')
+                   help='dist SpMV overlap=False 도 측정 (항상 측정됨)')
     p.add_argument('--no-csv', action='store_true')
     return p.parse_args()
 
@@ -275,7 +286,7 @@ def main():
         cuda_aware = bool(getattr(kspmv, 'cuda_aware_mpi', lambda: False)())
         if rank == 0:
             print(f"  GPUs: {n_gpu} | ranks: {size} | "
-                  f"CUDA-aware MPI: {'ON' if cuda_aware else 'OFF (host staging)'}")
+                  f"CUDA-aware MPI: {'ON' if cuda_aware else 'OFF'}")
 
     matrices = ALL_MATRICES if args.matrix == 'all' else [args.matrix]
     rows = []
@@ -311,25 +322,28 @@ def main():
             if 'kokkos_custom' in args.backend:
                 report('custom_1gpu', run_kokkos_1gpu(A, x, args.repeat, False))
         else:
-            # Distributed: BOTH local kernels → kk_{np}gpu / custom_{np}gpu
             rep = min(args.repeat, 50)
             report(f'kk_{size}gpu',
                    run_kokkos_dist(A, rank, size, rep, True,  True))
             report(f'custom_{size}gpu',
                    run_kokkos_dist(A, rank, size, rep, False, True))
-            if args.no_overlap:
-                report(f'kk_noovl_{size}gpu',
-                       run_kokkos_dist(A, rank, size, rep, True, False))
+            # noovl 은 항상 측정 (4GPU 역성장 분석에 필수)
+            report(f'kk_noovl_{size}gpu',
+                   run_kokkos_dist(A, rank, size, rep, True, False))
 
         # Batch sweep (single rank only)
-        ks = args.batch_sweep if args.batch_sweep else \
-             ([args.batch] if args.batch > 0 else [])
+        ks = args.batch_sweep if args.batch_sweep is not None else \
+             ([args.batch] if args.batch > 0 else DEFAULT_BATCH_SWEEP)
         if ks and size == 1:
             for k in ks:
                 if rank == 0:
                     print(f"  --- Batch SpMV (k={k}) ---")
-                report(f'jax_vmap',     run_batch_jax(A, k, max(args.repeat // 4, 10)))
-                report(f'kokkos_batch', run_batch(A, k, max(args.repeat // 2, 20)))
+                report('jax_vmap',
+                       run_batch_jax(A, k, max(args.repeat // 4, 10)))
+                report('kokkos_batch',
+                       run_batch(A, k, max(args.repeat // 2, 20)))
+                report('custom_batch',
+                       run_custom_batch(A, k, max(args.repeat // 2, 20)))
 
     if not args.no_csv and rank == 0 and rows:
         ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
