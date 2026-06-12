@@ -12,6 +12,11 @@ cupy-cuda12x>=13.0
 jax>=0.4.20
 jaxlib>=0.4.20
 
+# ─── PETSc (CG Baseline comparison) ───────────────────────────────────────────
+# Requires MPI to be properly configured on the system.
+petsc>=3.20
+petsc4py>=3.20
+
 # ─── MPI Python bindings ──────────────────────────────────────────────────────
 # The PPTX specifies mpi4py from the 4.1.1 git tag (not PyPI release).
 # This is important: pip install mpi4py installs an older version that may
