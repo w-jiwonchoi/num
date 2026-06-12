@@ -323,13 +323,17 @@ def main():
                 report('custom_1gpu', run_kokkos_1gpu(A, x, args.repeat, False))
         else:
             rep = min(args.repeat, 50)
-            report(f'kk_{size}gpu',
+            # KokkosKernels: Overlap (yovl) vs No-Overlap (noovl)
+            report(f'kk_ovl_{size}gpu',
                    run_kokkos_dist(A, rank, size, rep, True,  True))
-            report(f'custom_{size}gpu',
-                   run_kokkos_dist(A, rank, size, rep, False, True))
-            # noovl 은 항상 측정 (4GPU 역성장 분석에 필수)
             report(f'kk_noovl_{size}gpu',
                    run_kokkos_dist(A, rank, size, rep, True, False))
+            
+            # Custom Kernel: Overlap (yovl) vs No-Overlap (noovl)
+            report(f'custom_ovl_{size}gpu',
+                   run_kokkos_dist(A, rank, size, rep, False, True))
+            report(f'custom_noovl_{size}gpu',
+                   run_kokkos_dist(A, rank, size, rep, False, False))
 
         # Batch sweep (single rank only)
         ks = args.batch_sweep if args.batch_sweep is not None else \
