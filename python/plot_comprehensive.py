@@ -1,19 +1,8 @@
 """
-plot_comprehensive.py
-=====================
-Reads ALL benchmark/results/spmv_*.csv and cg_*.csv, concatenates them,
-and produces:
-
-  figA_time_vs_n.png     : per-matrix grid, Time(us) vs N (log-log lines)
-                           — the requested "N 증가에 따른 backend별 꺾은선"
-  figB_bw_vs_n.png       : per-matrix grid, BW(GB/s) vs N
-  figC_batch_sweep.png   : GFLOPS vs batch size k (per matrix)
-  figD_scaling.png       : strong scaling, time vs #GPUs (1/2/4) for
-                           kk_* and custom_* at the largest common N
-  figE_cg.png            : CG solve time vs N (scipy / petsc / 1gpu / 4gpu)
-  figF_overlap.png       : overlap ON vs OFF distributed SpMV
-
-Usage:  python3 plot_comprehensive.py
+plot_comprehensive.py  (v0.3 — fixed ls= kwarg conflict)
+=========================================================
+Fix: style_of() 가 ls 키를 포함할 때 grid_lines 의 ls='-' 와 충돌하던 버그 수정.
+     → plot() 호출 전에 style dict 에서 ls 를 꺼내 별도 처리.
 """
 import re
 import sys
@@ -31,18 +20,20 @@ PLOTS_DIR   = BASE / "plots"
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 STYLE = {
-    'scipy_cpu':    dict(color='#888888', marker='o', label='SciPy (CPU)'),
-    'jax_1gpu':     dict(color='#2196F3', marker='s', label='JAX BCOO (1 GPU)'),
-    'kk_1gpu':      dict(color='#4CAF50', marker='^', label='KokkosKernels (1 GPU)'),
-    'custom_1gpu':  dict(color='#FF9800', marker='D', label='Custom kernel (1 GPU)'),
-    'kk_2gpu':      dict(color='#26C6DA', marker='v', label='KK dist (2 GPU)'),
-    'custom_2gpu':  dict(color='#AB47BC', marker='v', label='Custom dist (2 GPU)'),
-    'kk_4gpu':      dict(color='#E91E63', marker='*', label='KK dist (4 GPU)'),
-    'custom_4gpu':  dict(color='#D32F2F', marker='*', label='Custom dist (4 GPU)'),
-    'kk_noovl_4gpu':dict(color='#9E9E9E', marker='x', ls='--',
-                         label='KK dist 4 GPU (no overlap)'),
-    'jax_vmap':     dict(color='#2196F3', marker='s', label='JAX vmap'),
-    'kokkos_batch': dict(color='#FF9800', marker='D', label='Kokkos batch'),
+    'scipy_cpu':         dict(color='#888888', marker='o',  label='SciPy (CPU)'),
+    'jax_1gpu':          dict(color='#2196F3', marker='s',  label='JAX BCOO (1 GPU)'),
+    'kk_1gpu':           dict(color='#4CAF50', marker='^',  label='KokkosKernels (1 GPU)'),
+    'custom_1gpu':       dict(color='#FF9800', marker='D',  label='Custom kernel (1 GPU)'),
+    'kk_2gpu':           dict(color='#26C6DA', marker='v',  label='KK dist (2 GPU)'),
+    'custom_2gpu':       dict(color='#AB47BC', marker='v',  label='Custom dist (2 GPU)'),
+    'kk_4gpu':           dict(color='#E91E63', marker='*',  label='KK dist (4 GPU)'),
+    'custom_4gpu':       dict(color='#D32F2F', marker='*',  label='Custom dist (4 GPU)'),
+    # noovl 계열은 ls='--' 를 style dict 안에 명시적으로 유지
+    'kk_noovl_2gpu':     dict(color='#9E9E9E', marker='x',  ls='--', label='KK 2GPU (no-ovl)'),
+    'kk_noovl_4gpu':     dict(color='#607D8B', marker='x',  ls='--', label='KK 4GPU (no-ovl)'),
+    'jax_vmap':          dict(color='#2196F3', marker='s',  label='JAX vmap'),
+    'kokkos_batch':      dict(color='#FF9800', marker='D',  label='Kokkos batch (kk)'),
+    'custom_batch':      dict(color='#F44336', marker='P',  label='Custom batch'),
 }
 
 plt.rcParams.update({
@@ -62,7 +53,6 @@ def load_all(prefix):
     if not dfs:
         return pd.DataFrame()
     df = pd.concat(dfs, ignore_index=True)
-    # Keep the latest measurement for duplicated (backend, matrix, N, k)
     keys = [c for c in ('backend', 'matrix', 'N', 'k', 'n_ranks', 'overlap')
             if c in df.columns]
     df = df.drop_duplicates(subset=keys, keep='last')
@@ -72,7 +62,11 @@ def load_all(prefix):
 
 
 def style_of(b):
-    return dict(STYLE.get(b, dict(label=b)))
+    """STYLE dict 복사본을 반환. ls 는 항상 포함 (없으면 '-' 기본값)."""
+    s = dict(STYLE.get(b, dict(label=b)))
+    if 'ls' not in s:
+        s['ls'] = '-'
+    return s
 
 
 def grid_lines(df, ycol, ylabel, title, path, logy=True):
@@ -94,7 +88,8 @@ def grid_lines(df, ycol, ylabel, title, path, logy=True):
             g = grp.dropna(subset=['N', ycol]).sort_values('N')
             if len(g) == 0:
                 continue
-            ax.plot(g['N'], g[ycol], ls='-', **style_of(backend))
+            s = style_of(backend)   # ls 는 여기에 이미 포함
+            ax.plot(g['N'], g[ycol], **s)
         ax.set_xscale('log')
         if logy:
             ax.set_yscale('log')
@@ -112,7 +107,7 @@ def grid_lines(df, ycol, ylabel, title, path, logy=True):
 
 def fig_batch(df):
     sub = df.dropna(subset=['k']) if 'k' in df.columns else pd.DataFrame()
-    sub = sub[sub['backend'].isin(['jax_vmap', 'kokkos_batch'])] \
+    sub = sub[sub['backend'].isin(['jax_vmap', 'kokkos_batch', 'custom_batch'])] \
           if not sub.empty else sub
     if sub.empty:
         print("  [SKIP] figC — no batch data")
@@ -128,12 +123,11 @@ def fig_batch(df):
         ax = axes[idx // ncol][idx % ncol]
         ax.set_visible(True)
         for backend, grp in sub[sub['matrix'] == mat].groupby('backend'):
-            # one line per N
             for Nval, g2 in grp.groupby('N'):
                 g2 = g2.sort_values('k')
                 s = style_of(backend)
                 s['label'] = f"{s.get('label', backend)} (N={int(Nval):,})"
-                ax.plot(g2['k'], g2['gflops'], ls='-', **s)
+                ax.plot(g2['k'], g2['gflops'], **s)
         ax.set_xscale('log', base=2)
         ax.set_xlabel('Batch size k')
         ax.set_ylabel('GFLOPS')
@@ -149,9 +143,8 @@ def fig_batch(df):
 
 
 def fig_scaling(df):
-    """Strong scaling: time vs #GPUs at the largest N measured on every count."""
     pat = re.compile(r'^(kk|custom)_(\d)gpu$')
-    sub = df[df['backend'].str.match(pat, na=False)].copy()
+    sub  = df[df['backend'].str.match(pat, na=False)].copy()
     base = df[df['backend'].isin(['kk_1gpu', 'custom_1gpu'])].copy()
     if sub.empty or base.empty:
         print("  [SKIP] figD — need both 1-GPU and dist results")
@@ -185,8 +178,9 @@ def fig_scaling(df):
                     label=f"{fam} (N={int(common_N):,})")
             if len(t1):
                 ideal = float(t1.iloc[0]) * 1e6 / g['n_ranks'].values
-                ax.plot(g['n_ranks'], ideal, ':', color=colors.get(fam),
-                        alpha=0.5, label=f"{fam} ideal")
+                ax.plot(g['n_ranks'], ideal, ':',
+                        color=colors.get(fam), alpha=0.5,
+                        label=f"{fam} ideal")
         ax.set_xlabel('#GPUs')
         ax.set_ylabel('Time (μs)')
         ax.set_yscale('log')
@@ -203,29 +197,24 @@ def fig_scaling(df):
 
 
 def fig_overlap(df):
-    if 'overlap' not in df.columns:
-        print("  [SKIP] figF — no overlap column")
+    """noovl vs overlap 비교. noovl 계열 데이터가 있을 때만 생성."""
+    if 'backend' not in df.columns:
+        print("  [SKIP] figF — no backend column")
         return
-    sub = df[df['backend'].str.contains('gpu', na=False)
-             & df['n_ranks'].notna()] if 'n_ranks' in df.columns else pd.DataFrame()
-    sub = sub[sub['backend'].str.startswith(('kk_', 'custom_'))] \
-          if not sub.empty else sub
-    noovl = sub[sub['backend'].str.contains('noovl')] if not sub.empty else pd.DataFrame()
+    noovl = df[df['backend'].str.contains('noovl', na=False)]
     if noovl.empty:
         print("  [SKIP] figF — run with --no-overlap to collect data")
         return
-    ovl = sub[~sub['backend'].str.contains('noovl')
-              & sub['backend'].str.startswith('kk_')]
+    ovl = df[df['backend'].str.match(r'^kk_\dgpu$', na=False)]
     fig, ax = plt.subplots(figsize=(7, 4))
-    for tag, g, c in [('overlap ON', ovl, '#E91E63'),
-                      ('overlap OFF', noovl, '#9E9E9E')]:
-        g = g.sort_values('N')
-        for mat, g2 in g.groupby('matrix'):
-            ax.plot(g2['N'], g2['elapsed_us'], 'o-' if 'ON' in tag else 'x--',
-                    color=c, label=f"{tag} ({mat})")
+    for tag, grp, ls in [('overlap ON', ovl, '-'), ('overlap OFF', noovl, '--')]:
+        for mat, g2 in grp.groupby('matrix'):
+            g2 = g2.sort_values('N')
+            ax.plot(g2['N'], g2['elapsed_us'], ls,
+                    label=f"{tag} ({mat})")
     ax.set_xscale('log'); ax.set_yscale('log')
     ax.set_xlabel('N'); ax.set_ylabel('Time (μs)')
-    ax.set_title('Distributed SpMV — comm/compute overlap effect (4 GPU)')
+    ax.set_title('Distributed SpMV — overlap ON vs OFF (4 GPU)')
     ax.grid(True, which='both', alpha=0.3)
     ax.legend(framealpha=0.85)
     fig.tight_layout()
@@ -244,7 +233,7 @@ def fig_cg(cg):
             'kspmv_cg_1gpu': '#FF9800', 'kspmv_cg_2gpu': '#AB47BC',
             'kspmv_cg_4gpu': '#E91E63'}
     for backend, g in cg.groupby('backend'):
-        if not str(backend).endswith('_cg') and 'cg' not in str(backend):
+        if 'cg' not in str(backend):
             continue
         g = g.dropna(subset=['N', 'elapsed_s']).sort_values('N')
         if g.empty:
