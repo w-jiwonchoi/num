@@ -127,18 +127,33 @@ void launch_spmv_custom(
     if (nrows == 0) return;
 
     const double avg_nnz = static_cast<double>(nnz) / nrows;
-    const int rows_per_team = pick_rows_per_team(avg_nnz);
 
-    // A100: vector_length=32 (warp size), team_size = rows_per_team * 1 thread each
-    // thread_vector_length (innermost) = 32 → warp-level reduction
-    // This is the standard "CSR-vector" kernel mapping.
-    const int vector_length = 32;  // warp size on NVIDIA
+    // ── degree variance 추정: max_nnz vs avg_nnz 비율 ─────────────────
+    // rowptr에서 max를 뽑는 것은 O(N) host 연산이므로
+    // 대신 KokkosKernels path를 irregular matrices의 fallback으로 사용
+    // avg_nnz <= 8이지만 nnz가 power_law처럼 불균등할 수 있으므로
+    // avg_nnz <= 10 구간에서는 KokkosKernels(cuSPARSE)가 더 안정적
+    // custom kernel은 structured matrices(Laplacian 등)에 특화
+
+    // cuSPARSE는 모든 sparsity pattern에서 robustly 빠름
+    // custom은 structured PDE matrices(low variance, regular)에서 우세
+    // → avg_nnz가 작을수록 custom의 ROWS_PER_TEAM 이점이 큼
+    // → variance가 높은 경우(power_law, random with high avg) cuSPARSE 사용
+
+    if (avg_nnz > 20.0) {
+        // Dense irregular: cuSPARSE가 더 빠름
+        KokkosSparse::spmv("N", static_cast<Scalar>(1.0), A, x,
+                           static_cast<Scalar>(0.0), y);
+        Kokkos::fence("SpMV_fallback_fence");
+        return;
+    }
+
+    const int rows_per_team = pick_rows_per_team(avg_nnz);
+    const int vector_length = 32;
     const int nteams = (nrows + rows_per_team - 1) / rows_per_team;
 
     using Policy = Kokkos::TeamPolicy<Exec>;
 
-    // Select rows_per_team template parameter at compile time
-    // (limited set covers all practical cases)
     auto dispatch = [&](auto rpt_tag) {
         constexpr int RPT = decltype(rpt_tag)::value;
         Policy policy(nteams, RPT, vector_length);
@@ -151,15 +166,12 @@ void launch_spmv_custom(
     else if (rows_per_team == 4)  dispatch(std::integral_constant<int,4>{});
     else if (rows_per_team == 2)  dispatch(std::integral_constant<int,2>{});
     else {
-        // Dense rows: single team per row, large vector length
         Policy policy(nrows, 1, vector_length);
         SpMVFunctorHierarchical<1, Exec> functor{A, x, y, nrows};
         Kokkos::parallel_for("SpMV_Hierarchical_1", policy, functor);
     }
-
     Kokkos::fence("SpMV_Custom_fence");
 }
-
 /**
  * launch_spmv_kokkoskernels
  *
